@@ -374,6 +374,27 @@ class TestMCPServiceGetMCPServers:
         assert headers == {'X-Access-Key': '***', 'X-Secret-Key': '***'}
         assert restore_mcp_secret_placeholders(submitted, persisted) == persisted
 
+    async def test_cordys_resolver_service_token_reference_is_redacted_and_roundtrips(self):
+        persisted = {
+            'extra_args': {
+                'user_headers': {
+                    'type': 'cordys',
+                    'actor_source': 'sender_id',
+                    'resolver_url': 'https://cordys.example.test/internal/agent/credential/resolve',
+                    'service_token_env': 'CORDYS_AGENT_CREDENTIAL_RESOLVER_TOKEN',
+                    'platform': 'LARK',
+                    'mcp_server_id': 'cordys-crm',
+                }
+            }
+        }
+
+        submitted = redact_mcp_secrets(persisted)
+
+        resolver = submitted['extra_args']['user_headers']
+        assert resolver['service_token_env'] == '***'
+        assert resolver['resolver_url'] == 'https://cordys.example.test/internal/agent/credential/resolve'
+        assert restore_mcp_secret_placeholders(submitted, persisted) == persisted
+
 
 class TestMCPServiceCreateMCPServer:
     """Tests for create_mcp_server method."""

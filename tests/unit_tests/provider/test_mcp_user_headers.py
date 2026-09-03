@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from langbot.pkg.api.http.context import ExecutionContext
@@ -21,6 +22,7 @@ TEST_CONTEXT = ExecutionContext(
     workspace_uuid='workspace-a',
     placement_generation=1,
 )
+TEST_RESOLVER_TOKEN = 'resolver-service-token-with-at-least-32-chars'
 
 
 def _app() -> SimpleNamespace:
@@ -144,8 +146,9 @@ def _set_test_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('TEST_MCP_USER_B_SECRET_KEY', 'secret-b')
 
 
-def test_resolve_user_headers_uses_exact_sender_mapping_without_exposing_actor_id():
-    resolved = resolve_user_headers(
+@pytest.mark.asyncio
+async def test_resolve_user_headers_uses_exact_sender_mapping_without_exposing_actor_id():
+    resolved = await resolve_user_headers(
         _server_config(),
         _query('user-a'),
         environ={
@@ -169,7 +172,8 @@ def test_resolve_user_headers_uses_exact_sender_mapping_without_exposing_actor_i
         ({'max_sessions': 0}, 'positive integer'),
     ],
 )
-def test_invalid_or_unmapped_user_header_configuration_fails_closed(config_change, expected_message):
+@pytest.mark.asyncio
+async def test_invalid_or_unmapped_user_header_configuration_fails_closed(config_change, expected_message):
     config = _server_config()
     config['user_headers'].update(config_change)
 
@@ -177,7 +181,109 @@ def test_invalid_or_unmapped_user_header_configuration_fails_closed(config_chang
         if 'max_sessions' in config_change:
             user_header_session_limit(config)
         else:
-            resolve_user_headers(config, _query('user-a'), environ={})
+            await resolve_user_headers(config, _query('user-a'), environ={})
+
+
+def _cordys_server_config() -> dict:
+    config = _server_config()
+    config['user_headers'] = {
+        'type': 'cordys',
+        'actor_source': 'sender_id',
+        'resolver_url': 'https://cordys.example.test/internal/agent/credential/resolve',
+        'service_token_env': 'TEST_CORDYS_RESOLVER_TOKEN',
+        'platform': 'LARK',
+        'mcp_server_id': 'cordys-crm',
+        'resolver_timeout_seconds': 3,
+        'max_sessions': 32,
+    }
+    return config
+
+
+@pytest.mark.asyncio
+async def test_cordys_resolver_uses_sender_id_and_returns_official_headers():
+    client = SimpleNamespace(
+        post=AsyncMock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'code': 100200,
+                    'data': {
+                        'actorId': 'cordys-user-a',
+                        'credentialId': 'key-a',
+                        'headers': {
+                            'X-Access-Key': 'access-a',
+                            'X-Secret-Key': 'secret-a',
+                        },
+                    },
+                },
+            )
+        )
+    )
+
+    resolved = await resolve_user_headers(
+        _cordys_server_config(),
+        _query('ou-user-a'),
+        environ={'TEST_CORDYS_RESOLVER_TOKEN': TEST_RESOLVER_TOKEN},
+        http_client=client,
+    )
+
+    assert resolved is not None
+    assert resolved.headers == {'X-Access-Key': 'access-a', 'X-Secret-Key': 'secret-a'}
+    assert resolved.actor_key != 'cordys-user-a'
+    assert 'access-a' not in resolved.credential_fingerprint
+    client.post.assert_awaited_once_with(
+        'https://cordys.example.test/internal/agent/credential/resolve',
+        json={
+            'platform': 'LARK',
+            'externalUserId': 'ou-user-a',
+            'mcpServerId': 'cordys-crm',
+        },
+        headers={'Authorization': f'Bearer {TEST_RESOLVER_TOKEN}'},
+        timeout=3.0,
+        follow_redirects=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('service_token', ['', 'too-short'])
+async def test_cordys_resolver_rejects_invalid_service_token_without_calling_endpoint(service_token):
+    client = SimpleNamespace(post=AsyncMock())
+    environ = {'TEST_CORDYS_RESOLVER_TOKEN': service_token} if service_token else {}
+
+    with pytest.raises(MCPUserHeadersError, match='service credential is unavailable'):
+        await resolve_user_headers(
+            _cordys_server_config(),
+            _query('ou-user-a'),
+            environ=environ,
+            http_client=client,
+        )
+
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cordys_resolver_rejects_unexpected_response_headers():
+    client = SimpleNamespace(
+        post=AsyncMock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    'data': {
+                        'actorId': 'cordys-user-a',
+                        'headers': {'Authorization': 'unexpected'},
+                    }
+                },
+            )
+        )
+    )
+
+    with pytest.raises(MCPUserHeadersError, match='unexpected headers'):
+        await resolve_user_headers(
+            _cordys_server_config(),
+            _query('ou-user-a'),
+            environ={'TEST_CORDYS_RESOLVER_TOKEN': TEST_RESOLVER_TOKEN},
+            http_client=client,
+        )
 
 
 @pytest.mark.asyncio

@@ -1984,7 +1984,7 @@ class MCPLoader(loader.ToolLoader):
         context: ExecutionContext,
         query: pipeline_query.Query,
     ) -> RuntimeMCPSession:
-        resolved = resolve_user_headers(discovery_session.server_config, query)
+        resolved = await resolve_user_headers(discovery_session.server_config, query)
         if resolved is None:
             return discovery_session
         if discovery_session.server_config.get('mode') not in ('remote', 'sse', 'http'):
