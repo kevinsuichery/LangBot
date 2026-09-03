@@ -12,6 +12,7 @@ from ....entity.persistence import mcp as persistence_mcp
 from ....entity.persistence import plugin as persistence_plugin
 from ....provider.tools.loaders.mcp import MCPSessionStatus, RuntimeMCPSession
 from ....provider.tools.loaders.mcp_policy import require_stdio_mcp_enabled
+from ....provider.tools.loaders.mcp_user_headers import has_user_headers, validate_user_headers_config
 from ....workspace.errors import WorkspaceNotFoundError
 from ..context import ExecutionContext
 from .secrets import is_url_key, redact_url_secrets, restore_url_secret_placeholders
@@ -58,6 +59,15 @@ _SENSITIVE_KEY_QUALIFIERS = frozenset(
         'signing',
     }
 )
+
+
+def _validate_user_header_settings(server_data: dict) -> None:
+    extra_args = server_data.get('extra_args', {})
+    if not isinstance(extra_args, dict):
+        raise ValueError('MCP extra_args must be an object')
+    validate_user_headers_config(extra_args)
+    if has_user_headers(extra_args) and server_data.get('mode') not in ('remote', 'sse', 'http'):
+        raise ValueError('MCP user headers require an HTTP-based MCP transport')
 
 
 def _normalize_config_key(key: object) -> str:
@@ -236,6 +246,7 @@ class MCPService:
         payload['name'] = server_name
         payload['workspace_uuid'] = workspace_uuid
         payload['uuid'] = str(uuid.uuid4())
+        _validate_user_header_settings(payload)
 
         existing_result = await self.ap.persistence_mgr.execute_async(
             sqlalchemy.select(persistence_mcp.MCPServer).where(
@@ -333,6 +344,7 @@ class MCPService:
                 raise ValueError(f'MCP server already exists: {payload["name"]}')
 
         effective_server = {**old_server, **payload}
+        _validate_user_header_settings(effective_server)
         # Existing disabled rows remain readable/deletable.  Switching away
         # from stdio or explicitly disabling one is also allowed, but an
         # update may never leave a disabled stdio server enabled.
@@ -462,6 +474,7 @@ class MCPService:
             payload.pop('workspace_uuid', None)
             payload['workspace_uuid'] = execution_context.workspace_uuid
             require_stdio_mcp_enabled(self.ap, payload)
+            _validate_user_header_settings(payload)
             runtime_mcp_session = await self.ap.tool_mgr.mcp_tool_loader.load_mcp_server(
                 execution_context,
                 payload,

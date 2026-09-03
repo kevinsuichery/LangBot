@@ -350,6 +350,30 @@ class TestMCPServiceGetMCPServers:
         assert submitted['extra_args']['url'] == 'https://***@mcp.invalid/connect?token=***&transport=http'
         assert restore_mcp_secret_placeholders(submitted, persisted) == persisted
 
+    async def test_user_header_environment_references_are_redacted_and_roundtrip(self):
+        persisted = {
+            'extra_args': {
+                'user_headers': {
+                    'type': 'env',
+                    'actor_source': 'sender_id',
+                    'actors': {
+                        'feishu-user-a': {
+                            'headers': {
+                                'X-Access-Key': 'CORDYS_USER_A_ACCESS_KEY',
+                                'X-Secret-Key': 'CORDYS_USER_A_SECRET_KEY',
+                            }
+                        }
+                    },
+                }
+            }
+        }
+
+        submitted = redact_mcp_secrets(persisted)
+
+        headers = submitted['extra_args']['user_headers']['actors']['feishu-user-a']['headers']
+        assert headers == {'X-Access-Key': '***', 'X-Secret-Key': '***'}
+        assert restore_mcp_secret_placeholders(submitted, persisted) == persisted
+
 
 class TestMCPServiceCreateMCPServer:
     """Tests for create_mcp_server method."""

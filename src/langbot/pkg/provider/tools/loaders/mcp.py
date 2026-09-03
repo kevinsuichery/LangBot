@@ -42,6 +42,13 @@ from .mcp_stdio import (
     _get_default_memory_mb,
 )
 from .mcp_policy import require_stdio_mcp_enabled, stdio_mcp_enabled
+from .mcp_user_headers import (
+    USER_HEADERS_CONFIG_KEY,
+    MCPUserHeadersError,
+    has_user_headers,
+    resolve_user_headers,
+    user_header_session_limit,
+)
 
 # Synthesized LLM tools for MCP resources (not from server tools/list).
 # Dispatched in MCPLoader.invoke_tool; placeholder func on LLMTool is never used.
@@ -1522,10 +1529,19 @@ class MCPLoader(loader.ToolLoader):
 
     _sessions: dict[tuple[str, str, int, str], RuntimeMCPSession]
 
+    _actor_sessions: dict[tuple[str, str, int, str, str, str], RuntimeMCPSession]
+
     _hosted_mcp_tasks: list[asyncio.Task]
 
     def __init__(self, ap: app.Application):
         super().__init__(ap)
+        self._actor_sessions = {}
+        self._actor_session_last_used: dict[tuple[str, str, int, str, str, str], float] = {}
+        self._actor_session_keys_by_scope: dict[
+            tuple[str, str, int],
+            set[tuple[str, str, int, str, str, str]],
+        ] = {}
+        self._actor_session_locks: dict[tuple[str, str, int, str], asyncio.Lock] = {}
         self.sessions = {}
         self._hosted_mcp_tasks = []
         self._hosted_mcp_tasks_by_scope: dict[
@@ -1608,6 +1624,7 @@ class MCPLoader(loader.ToolLoader):
     def _drop_empty_scope(self, scope_key: tuple[str, str, int]) -> None:
         if (
             scope_key not in self._session_keys_by_scope
+            and scope_key not in self._actor_session_keys_by_scope
             and scope_key not in self._hosted_mcp_tasks_by_scope
             and self._scope_generations.get(scope_key[:2]) == scope_key[2]
         ):
@@ -1675,7 +1692,14 @@ class MCPLoader(loader.ToolLoader):
 
         keys = tuple(self._session_keys_by_scope.pop(scope_key, ()))
         sessions = [session for key in keys if (session := self._sessions.pop(key, None)) is not None]
-        await self._shutdown_sessions(sessions)
+        actor_keys = tuple(self._actor_session_keys_by_scope.pop(scope_key, ()))
+        actor_sessions = [session for key in actor_keys if (session := self._actor_sessions.pop(key, None)) is not None]
+        for key in actor_keys:
+            self._actor_session_last_used.pop(key, None)
+        for key in tuple(self._actor_session_locks):
+            if key[:3] == scope_key:
+                self._actor_session_locks.pop(key, None)
+        await self._shutdown_sessions([*sessions, *actor_sessions])
         if self._scope_generations.get(scope_key[:2]) == scope_key[2]:
             self._scope_generations.pop(scope_key[:2], None)
 
@@ -1774,8 +1798,12 @@ class MCPLoader(loader.ToolLoader):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        sessions = tuple(self._sessions.values())
+        sessions = (*self._sessions.values(), *self._actor_sessions.values())
         self.sessions = {}
+        self._actor_sessions.clear()
+        self._actor_session_last_used.clear()
+        self._actor_session_keys_by_scope.clear()
+        self._actor_session_locks.clear()
         await self._shutdown_sessions(sessions)
 
     async def _shutdown_sessions(
@@ -1926,6 +1954,123 @@ class MCPLoader(loader.ToolLoader):
             if (session := self._sessions.get(key)) is not None
         ]
 
+    def _discard_actor_session(
+        self,
+        key: tuple[str, str, int, str, str, str],
+    ) -> RuntimeMCPSession | None:
+        session = self._actor_sessions.pop(key, None)
+        self._actor_session_last_used.pop(key, None)
+        scope_key = key[:3]
+        keys = self._actor_session_keys_by_scope.get(scope_key)
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                self._actor_session_keys_by_scope.pop(scope_key, None)
+        self._drop_empty_scope(scope_key)
+        return session
+
+    def _pop_actor_sessions_for_server(
+        self,
+        context: TenantContext,
+        server_name: str,
+    ) -> list[RuntimeMCPSession]:
+        scope_key = self._scope_key(context)
+        keys = tuple(key for key in self._actor_session_keys_by_scope.get(scope_key, ()) if key[3] == server_name)
+        return [session for key in keys if (session := self._discard_actor_session(key)) is not None]
+
+    async def _session_for_query(
+        self,
+        discovery_session: RuntimeMCPSession,
+        context: ExecutionContext,
+        query: pipeline_query.Query,
+    ) -> RuntimeMCPSession:
+        resolved = resolve_user_headers(discovery_session.server_config, query)
+        if resolved is None:
+            return discovery_session
+        if discovery_session.server_config.get('mode') not in ('remote', 'sse', 'http'):
+            raise MCPUserHeadersError('MCP user headers require an HTTP-based MCP transport')
+
+        scope_key = self._scope_key(context)
+        server_name = discovery_session.server_name
+        key = (
+            *scope_key,
+            server_name,
+            resolved.actor_key,
+            resolved.credential_fingerprint,
+        )
+        lock_key = (*scope_key, server_name)
+        lock = self._actor_session_locks.setdefault(lock_key, asyncio.Lock())
+
+        async with lock:
+            if self.get_session(context, server_name) is not discovery_session:
+                raise WorkspaceInvariantError('MCP server changed while resolving a user session')
+
+            existing = self._actor_sessions.get(key)
+            if existing is not None and existing.status == MCPSessionStatus.CONNECTED and existing.session is not None:
+                self._actor_session_last_used[key] = time.monotonic()
+                return existing
+
+            sessions_to_shutdown: list[RuntimeMCPSession] = []
+            if existing is not None:
+                discarded = self._discard_actor_session(key)
+                if discarded is not None:
+                    sessions_to_shutdown.append(discarded)
+
+            # Credential rotation creates a new fingerprint. Retire the old
+            # connection for the same actor before establishing the new one.
+            scoped_keys = tuple(self._actor_session_keys_by_scope.get(scope_key, ()))
+            for candidate in scoped_keys:
+                if candidate[3] == server_name and candidate[4] == resolved.actor_key and candidate != key:
+                    discarded = self._discard_actor_session(candidate)
+                    if discarded is not None:
+                        sessions_to_shutdown.append(discarded)
+
+            max_sessions = user_header_session_limit(discovery_session.server_config)
+            server_keys = [
+                candidate
+                for candidate in self._actor_session_keys_by_scope.get(scope_key, ())
+                if candidate[3] == server_name
+            ]
+            if len(server_keys) >= max_sessions:
+                oldest_key = min(
+                    server_keys,
+                    key=lambda candidate: self._actor_session_last_used.get(candidate, 0.0),
+                )
+                discarded = self._discard_actor_session(oldest_key)
+                if discarded is not None:
+                    sessions_to_shutdown.append(discarded)
+
+            if sessions_to_shutdown:
+                await self._shutdown_sessions(sessions_to_shutdown)
+
+            base_headers = discovery_session.server_config.get('headers', {})
+            if not isinstance(base_headers, dict):
+                raise MCPUserHeadersError('MCP static headers must be an object')
+            actor_config = dict(discovery_session.server_config)
+            actor_config.pop(USER_HEADERS_CONFIG_KEY, None)
+            actor_config['headers'] = {**base_headers, **resolved.headers}
+            actor_session = RuntimeMCPSession(
+                server_name,
+                actor_config,
+                discovery_session.enable,
+                self.ap,
+                context,
+            )
+            try:
+                await actor_session.start()
+            except BaseException:
+                await actor_session.shutdown()
+                raise
+
+            if self.get_session(context, server_name) is not discovery_session:
+                await actor_session.shutdown()
+                raise WorkspaceInvariantError('MCP server changed while starting a user session')
+
+            self._actor_sessions[key] = actor_session
+            self._actor_session_last_used[key] = time.monotonic()
+            self._actor_session_keys_by_scope.setdefault(scope_key, set()).add(key)
+            return actor_session
+
     async def host_mcp_server(
         self,
         context: TenantContext,
@@ -1950,7 +2095,7 @@ class MCPLoader(loader.ToolLoader):
             raise ValueError('MCP server configuration belongs to another Workspace')
         server_config = dict(server_config)
         server_config['workspace_uuid'] = execution_context.workspace_uuid
-        self.ap.logger.debug(f'Loading MCP server {server_config}')
+        self.ap.logger.debug(f'Loading MCP server {server_config.get("name")}({server_config.get("uuid")})')
         try:
             session = await self.load_mcp_server(execution_context, server_config)
             await self._assert_execution_active(execution_context)
@@ -1958,8 +2103,13 @@ class MCPLoader(loader.ToolLoader):
                 execution_context,
                 server_config['name'],
             )
-            if old_session is not None:
-                await old_session.shutdown()
+            actor_sessions = self._pop_actor_sessions_for_server(
+                execution_context,
+                server_config['name'],
+            )
+            sessions_to_shutdown = ([old_session] if old_session is not None else []) + actor_sessions
+            if sessions_to_shutdown:
+                await self._shutdown_sessions(sessions_to_shutdown)
             self._register_session(
                 execution_context,
                 server_config['name'],
@@ -2107,9 +2257,10 @@ class MCPLoader(loader.ToolLoader):
                 )
             ]
 
-        session = self.get_session(execution_context, server_name)
-        if session is None or session.status != MCPSessionStatus.CONNECTED:
+        discovery_session = self.get_session(execution_context, server_name)
+        if discovery_session is None or discovery_session.status != MCPSessionStatus.CONNECTED:
             return [provider_message.ContentElement.from_text(f'Error: MCP server not connected: {server_name!r}')]
+        session = await self._session_for_query(discovery_session, execution_context, query)
 
         data = session.get_resources()
         templates = session.get_resource_templates()
@@ -2142,9 +2293,10 @@ class MCPLoader(loader.ToolLoader):
                 )
             ]
 
-        session = self.get_session(execution_context, server_name)
-        if session is None or session.status != MCPSessionStatus.CONNECTED:
+        discovery_session = self.get_session(execution_context, server_name)
+        if discovery_session is None or discovery_session.status != MCPSessionStatus.CONNECTED:
             return [provider_message.ContentElement.from_text(f'Error: MCP server not connected: {server_name!r}')]
+        session = await self._session_for_query(discovery_session, execution_context, query)
 
         try:
             envelope = await session.read_resource_envelope(
@@ -2293,7 +2445,10 @@ class MCPLoader(loader.ToolLoader):
                 if function.name == name:
                     self.ap.logger.debug(f'Invoking MCP tool: {name} with parameters: {parameters}')
                     try:
-                        result = await session.invoke_mcp_tool(name, parameters, query=query)
+                        invocation_session = await self._session_for_query(session, execution_context, query)
+                        if all(tool.name != name for tool in invocation_session.get_tools()):
+                            raise ValueError(f'Tool not available to the current MCP user: {name}')
+                        result = await invocation_session.invoke_mcp_tool(name, parameters, query=query)
                         self.ap.logger.debug(f'MCP tool {name} executed successfully')
                         return result
                     except Exception as e:
@@ -2335,6 +2490,10 @@ class MCPLoader(loader.ToolLoader):
         session = self.get_session(context, server_name)
         if session is None:
             raise ValueError(f'MCP server not found: {server_name}')
+        if has_user_headers(session.server_config):
+            if query is None:
+                raise MCPUserHeadersError('MCP user identity is required to read this resource')
+            session = await self._session_for_query(session, _execution_context_from_query(query), query)
         return await session.read_resource_envelope(
             uri,
             max_bytes=max_bytes,
@@ -2408,11 +2567,15 @@ class MCPLoader(loader.ToolLoader):
             if not uri or not isinstance(uri, str):
                 continue
 
-            session = self._resolve_attachment_session(execution_context, attachment)
-            if session is None:
+            discovery_session = self._resolve_attachment_session(execution_context, attachment)
+            if discovery_session is None:
                 continue
-            if session.server_uuid not in eligible_by_uuid and session.server_name not in eligible_by_name:
+            if (
+                discovery_session.server_uuid not in eligible_by_uuid
+                and discovery_session.server_name not in eligible_by_name
+            ):
                 continue
+            session = await self._session_for_query(discovery_session, execution_context, query)
 
             max_tokens = min(int(attachment.get('max_tokens') or remaining_tokens), remaining_tokens)
             max_bytes = int(attachment.get('max_bytes') or default_max_bytes)
@@ -2478,7 +2641,9 @@ class MCPLoader(loader.ToolLoader):
         session = self._pop_session(context, server_name)
         if session is None:
             return
-        await session.shutdown()
+        actor_sessions = self._pop_actor_sessions_for_server(context, server_name)
+        await self._shutdown_sessions([session, *actor_sessions])
+        self._actor_session_locks.pop((*self._scope_key(context), server_name), None)
         self.ap.logger.info(f'Removed MCP server: {server_name}')
 
     def get_session(self, context: TenantContext, server_name: str) -> RuntimeMCPSession | None:
