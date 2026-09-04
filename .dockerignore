@@ -6,3 +6,5 @@
 web/.next
 web/node_modules
 web/.env
+._*
+**/._*
