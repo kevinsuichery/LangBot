@@ -642,10 +642,16 @@ class MonitoringService:
         session_id: str,
         pipeline_id: str | None = None,
         pipeline_name: str | None = None,
+        user_id: str | None = None,
+        user_name: str | None = None,
     ) -> bool:
         """Update session last activity time and increment message count.
 
         Also updates pipeline info if the bot's pipeline has changed.
+        Session-level user metadata is retained only while every observed
+        message belongs to the same user. A null user then unambiguously means
+        that the session is unowned or has multiple participants; per-message
+        user metadata remains authoritative for attribution.
 
         Returns:
             True if session was found and updated, False if session doesn't exist.
@@ -661,6 +667,22 @@ class MonitoringService:
             update_values['pipeline_id'] = pipeline_id
         if pipeline_name is not None:
             update_values['pipeline_name'] = pipeline_name
+        if user_id is not None:
+            different_user_exists = sqlalchemy.exists().where(
+                persistence_monitoring.MonitoringMessage.workspace_uuid == workspace_uuid,
+                persistence_monitoring.MonitoringMessage.session_id == session_id,
+                persistence_monitoring.MonitoringMessage.role == 'user',
+                persistence_monitoring.MonitoringMessage.user_id.is_not(None),
+                persistence_monitoring.MonitoringMessage.user_id != user_id,
+            )
+            update_values['user_id'] = sqlalchemy.case(
+                (different_user_exists, None),
+                else_=user_id,
+            )
+            update_values['user_name'] = sqlalchemy.case(
+                (different_user_exists, None),
+                else_=user_name if user_name is not None else persistence_monitoring.MonitoringSession.user_name,
+            )
 
         result = await self.ap.persistence_mgr.execute_async(
             sqlalchemy.update(persistence_monitoring.MonitoringSession)

@@ -81,6 +81,8 @@ class MonitoringHelper:
                 session_id,
                 pipeline_id=pipeline_id,
                 pipeline_name=pipeline_name,
+                user_id=query.sender_id,
+                user_name=sender_name,
             )
             if not session_updated:
                 # Session doesn't exist, create it

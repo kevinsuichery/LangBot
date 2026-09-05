@@ -138,6 +138,102 @@ async def test_same_session_and_resource_ids_do_not_collide(service):
     assert (await service.get_message_details(context_a, message_b))['found'] is False
 
 
+async def test_session_user_is_cleared_when_multiple_users_share_session(service):
+    context = _context(WORKSPACE_A)
+    await service.record_message(
+        context,
+        bot_id='same-bot',
+        bot_name='Same Bot',
+        pipeline_id='same-pipeline',
+        pipeline_name='Same Pipeline',
+        message_content='first group message',
+        session_id='shared-group',
+        platform='group',
+        user_id='user-a',
+        user_name='User A',
+    )
+    await service.record_session_start(
+        context,
+        session_id='shared-group',
+        bot_id='same-bot',
+        bot_name='Same Bot',
+        pipeline_id='same-pipeline',
+        pipeline_name='Same Pipeline',
+        platform='group',
+        user_id='user-a',
+        user_name='User A',
+    )
+
+    await service.record_message(
+        context,
+        bot_id='same-bot',
+        bot_name='Same Bot',
+        pipeline_id='same-pipeline',
+        pipeline_name='Same Pipeline',
+        message_content='same user group message',
+        session_id='shared-group',
+        platform='group',
+        user_id='user-a',
+        user_name='User A Updated',
+    )
+    assert await service.update_session_activity(
+        context,
+        'shared-group',
+        user_id='user-a',
+        user_name='User A Updated',
+    )
+    sessions, total = await service.get_sessions(context)
+    assert total == 1
+    assert sessions[0]['user_id'] == 'user-a'
+    assert sessions[0]['user_name'] == 'User A Updated'
+
+    await service.record_message(
+        context,
+        bot_id='same-bot',
+        bot_name='Same Bot',
+        pipeline_id='same-pipeline',
+        pipeline_name='Same Pipeline',
+        message_content='second user group message',
+        session_id='shared-group',
+        platform='group',
+        user_id='user-b',
+        user_name='User B',
+    )
+    assert await service.update_session_activity(
+        context,
+        'shared-group',
+        user_id='user-b',
+        user_name='User B',
+    )
+    sessions, _ = await service.get_sessions(context)
+    assert sessions[0]['user_id'] is None
+    assert sessions[0]['user_name'] is None
+
+    # Once a session is known to be multi-user, later activity must not assign
+    # it back to whichever participant happened to speak most recently.
+    await service.record_message(
+        context,
+        bot_id='same-bot',
+        bot_name='Same Bot',
+        pipeline_id='same-pipeline',
+        pipeline_name='Same Pipeline',
+        message_content='first user returns',
+        session_id='shared-group',
+        platform='group',
+        user_id='user-a',
+        user_name='User A',
+    )
+    assert await service.update_session_activity(
+        context,
+        'shared-group',
+        user_id='user-a',
+        user_name='User A',
+    )
+    sessions, _ = await service.get_sessions(context)
+    assert sessions[0]['user_id'] is None
+    assert sessions[0]['user_name'] is None
+
+
 async def test_tool_call_inherits_context_from_connection_message_row(service):
     context = _context(WORKSPACE_A)
     message_id = await _record_message(service, context, 'tool context')

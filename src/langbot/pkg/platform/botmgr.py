@@ -246,6 +246,8 @@ class RuntimeBot:
             session_updated = await self.ap.monitoring_service.update_session_activity(
                 self.execution_context,
                 session_id,
+                user_id=str(sender_id),
+                user_name=sender_name,
             )
             if not session_updated:
                 # No session yet (first message for this launcher was discarded).
